@@ -33,20 +33,50 @@ ArchDBer::ArchDBer(const Params &p)
     dumpVaddrTrace(p.dump_vaddr_trace),
     dumpLifetime(p.dump_lifetime),
     mem_db(nullptr), zErrMsg(nullptr),rc(0),
-    db_path(p.arch_db_file)
+    db_path(p.arch_db_file),
+    streamToDisk(p.stream_to_disk),
+    batchSize(p.batch_size ? p.batch_size : 1),
+    pendingInserts(0)
 {
-  int rc = sqlite3_open(":memory:", &mem_db);
-  if (rc) {
-    sqlite3_close(mem_db);
-    fatal("Can't open database: %s\n", sqlite3_errmsg(mem_db));
-  }
-
   fatal_if(db_path == "" || db_path == "None",
             "Arch db file path is not given!");
+
+  if (streamToDisk) {
+    // Write straight to the on-disk file. Remove any stale db first so
+    // CREATE TABLE below starts clean.
+    ::unlink(db_path.c_str());
+    int rc = sqlite3_open(db_path.c_str(), &mem_db);
+    if (rc) {
+      sqlite3_close(mem_db);
+      fatal("Can't open database: %s\n", sqlite3_errmsg(mem_db));
+    }
+    // Trade crash-durability for speed: dirty pages go to the OS page
+    // cache and are flushed lazily, so disk writes rarely stall the sim.
+    sqlite3_exec(mem_db, "PRAGMA synchronous=OFF;", nullptr, nullptr,
+                 nullptr);
+    sqlite3_exec(mem_db, "PRAGMA journal_mode=MEMORY;", nullptr, nullptr,
+                 nullptr);
+    sqlite3_exec(mem_db, "PRAGMA temp_store=MEMORY;", nullptr, nullptr,
+                 nullptr);
+  } else {
+    int rc = sqlite3_open(":memory:", &mem_db);
+    if (rc) {
+      sqlite3_close(mem_db);
+      fatal("Can't open database: %s\n", sqlite3_errmsg(mem_db));
+    }
+  }
 
   for (const auto &s : p.table_cmds) {
     create_table(s);
   }
+
+  if (streamToDisk) {
+    // Batch inserts inside explicit transactions.
+    sqlite3_exec(mem_db, "BEGIN;", nullptr, nullptr, nullptr);
+    warn("arch_db: streaming to disk at %s (batch=%llu inserts/txn)\n",
+         db_path.c_str(), (unsigned long long)batchSize);
+  }
+
   registerExitCallback([this](){ save_db(); });
 }
 
@@ -66,6 +96,14 @@ void ArchDBer::start_recording() {
 }
 
 void ArchDBer::save_db() {
+  if (streamToDisk) {
+    // Data is already on disk; just commit the last open transaction.
+    warn("arch_db: committing final transaction to %s ...\n",
+         db_path.c_str());
+    sqlite3_exec(mem_db, "COMMIT;", nullptr, nullptr, nullptr);
+    pendingInserts = 0;
+    return;
+  }
   warn("saving memdb to %s ...\n", db_path.c_str());
   sqlite3 *disk_db;
   sqlite3_backup *pBackup;
@@ -82,11 +120,23 @@ void ArchDBer::save_db() {
 }
 
 void
+ArchDBer::flushBatch()
+{
+  // Commit the pending rows to the db file and open a fresh transaction.
+  sqlite3_exec(mem_db, "COMMIT;", nullptr, nullptr, nullptr);
+  sqlite3_exec(mem_db, "BEGIN;", nullptr, nullptr, nullptr);
+  pendingInserts = 0;
+}
+
+void
 ArchDBer::execmd(std::string cmd)
 {
   rc = sqlite3_exec(mem_db, cmd.c_str(), callback, 0, &zErrMsg);
   if (rc != SQLITE_OK) {
     fatal("SQL error: %s\n", zErrMsg);
+  }
+  if (streamToDisk && ++pendingInserts >= batchSize) {
+    flushBatch();
   }
 }
 

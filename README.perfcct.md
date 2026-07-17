@@ -5,13 +5,12 @@ replays, per-cycle module occupancy) from XS-GEM5's PerfCCT / Arch DB trace.
 
 Two pieces:
 
-- `util/perfcct_report.py` — turns a `lifetime.db` into HTML reports and/or a
-  standalone dynamic viewer.
-- `util/perfcct_viewer.html` — a **db-agnostic** viewer (SQLite compiled to
-  WebAssembly via [sql.js]). Open it once, then load *any* `lifetime.db` from a
-  file picker; no regeneration per program.
-
-[sql.js]: https://sql.js.org/
+- `util/perfcct_report.py` — turns a `lifetime.db` into static HTML reports.
+- `util/perfcct_viewer.html` + `util/perfcct_server.py` — a **db-agnostic**
+  interactive viewer. The viewer runs every query against a small local backend
+  (`perfcct_server.py`) that holds the on-disk SQLite file, so **arbitrarily
+  large dbs** (full simpoints, multi-GB) are explored with only a few MB of
+  browser/server memory. No regeneration per program.
 
 ---
 
@@ -28,9 +27,9 @@ scons build/RISCV/gem5.opt --gold-linker -j$(nproc)
 
 ## 1. Produce `lifetime.db`
 
-Run gem5 with the Arch DB enabled. `--enable-arch-db` turns it on and
-`--arch-db-file` chooses where the SQLite file is written (instruction
-lifetime dumping is on by default):
+Run gem5 with the Arch DB enabled. `--enable-arch-db` turns it on,
+`--arch-db-dump-lifetime` records the per-instruction lifetime trace this
+tooling needs, and `--arch-db-file` chooses where the SQLite file is written:
 
 ```bash
 export GCBV_REF_SO=`realpath riscv64-nemu-interpreter-*-so`   # difftest ref
@@ -38,12 +37,30 @@ export GCBV_REF_SO=`realpath riscv64-nemu-interpreter-*-so`   # difftest ref
 mkdir -p m5out/coremark_perfcct
 ./build/RISCV/gem5.opt configs/example/kmhv3.py \
   --raw-cpt --generic-rv-cpt=./ready-to-run/coremark-2-iteration.bin \
-  --enable-arch-db \
+  --enable-arch-db --arch-db-dump-lifetime \
   --arch-db-file=m5out/coremark_perfcct/lifetime.db
 ```
 
 For a different workload just change `--generic-rv-cpt=<bin-or-checkpoint>` and
 `--arch-db-file=<path>`.
+
+### Long runs / full simpoints: stream the db to disk
+
+By default the Arch DB is buffered entirely in RAM and written out at exit, so
+memory grows linearly with the trace and a full simpoint (tens of millions of
+insts, multi-GB db) can OOM the machine. Add `--arch-db-stream-to-disk` to write
+straight to the on-disk file in batched transactions instead — peak memory then
+stays roughly constant (tens of MB) regardless of trace length, at ~a few
+percent runtime overhead:
+
+```bash
+./build/RISCV/gem5.opt configs/example/kmhv3.py \
+  --generic-rv-cpt=/path/to/simpoint/_..._memory_.zstd --gcpt-restorer=None \
+  --enable-arch-db --arch-db-dump-lifetime --arch-db-stream-to-disk \
+  --arch-db-file=m5out/gcc/lifetime.db
+```
+
+`--arch-db-batch-size=<N>` (default 100000) controls inserts per transaction.
 
 The db contains three relevant tables:
 
@@ -53,7 +70,11 @@ The db contains three relevant tables:
 | `LoadLifeTimeCommitTrace` | loads only: vaddr/paddr, replay type string, replay/execute ticks |
 | `SquashedLifeTimeTrace` | wrong-path (squashed) instructions' partial lifecycle |
 
-## 2. Generate the viewer (and optional static reports)
+## 2. (Optional) Generate static reports / a customised viewer
+
+The interactive viewer (step 3) needs no generation step. Use
+`perfcct_report.py` only for static HTML reports or to bake custom defaults into
+a viewer copy:
 
 ```bash
 python3 util/perfcct_report.py m5out/coremark_perfcct/lifetime.db \
@@ -63,8 +84,10 @@ python3 util/perfcct_report.py m5out/coremark_perfcct/lifetime.db \
 
 Outputs (prefixed by `-o`):
 
-- `coremark_viewer.html` — **main tool**, dynamic, loads the whole db on demand.
-- `coremark_detail.html` — static per-cycle + per-instruction report.
+- `coremark_detail.html` — static per-cycle + per-instruction report (self
+  contained; good for very large dbs where you only need a fixed cycle range).
+- `coremark_viewer.html` — a copy of the interactive viewer with these options
+  baked in as defaults; serve it with `perfcct_server.py --viewer`.
 - with `--part both`: also `coremark_overview.html` — program-wide charts.
 
 Useful options (baked into the viewer as defaults; still editable in its
@@ -78,23 +101,50 @@ header at runtime):
 | `--part` | `overview` / `detail` / `both` | `both` |
 | `--viewer` | also emit the standalone dynamic viewer | off |
 
-## 3. Open the viewer and load a db
+## 3. Open the interactive viewer (server-backed)
 
-1. Open `coremark_viewer.html` in a browser.
-2. Use the file picker to select a `lifetime.db`.
-3. Explore: two per-cycle module-occupancy panels (incl. squashed insts), a
-   cycle slider, and a paginated per-instruction table with filter / sort /
-   expand.
+The viewer queries a local backend instead of loading the db into the browser,
+so start the server pointing at your `lifetime.db`, then browse to it:
 
-> The viewer pulls sql.js from a CDN (`cdnjs.cloudflare.com`), so the **first**
-> open needs internet access.
+```bash
+python3 util/perfcct_server.py --db m5out/coremark_perfcct/lifetime.db --port 8000
+# then open http://localhost:8000/ in a browser
+```
+
+Explore: two per-cycle module-occupancy panels (incl. squashed insts), a cycle
+slider, and a paginated per-instruction table with filter / sort / expand. The
+options in the header (period, I/O exclusion, window, sort) apply live.
+
+- Memory is bounded: an 8 GB / 40 M-inst db is served with only a few MB of RAM
+  on both ends, so full simpoints are fine.
+- `--port` picks the port; `--viewer` lets you point at a customised
+  `*_viewer.html` (e.g. one generated by `perfcct_report.py --viewer` with baked
+  defaults). By default it serves `util/perfcct_viewer.html`.
+- Everything is local (`127.0.0.1`); nothing is uploaded and no CDN is needed.
+
+### Large dbs (multi-GB / full simpoints): index once
+
+Without indexes every panel query full-scans the table (tens of seconds on a
+40 M-inst db). Add `--index` the **first** time you serve a db to build the
+`AtFetch` / `AtCommit` indexes it needs (one-time, ~2 min and ~+1.5 GB for a
+40 M-inst db; persisted in the file, so later launches can drop `--index`):
+
+```bash
+python3 util/perfcct_server.py --db m5out/gcc/lifetime.db --index --port 8000
+```
+
+After indexing, per-window panels are exact and sub-100 ms. A few whole-run
+figures are then approximated to keep the UI instant (committed-inst count shown
+with `≈`, the busiest-cycle default becomes the run midpoint, I/O-cycle
+accounting and slider I/O-compaction are skipped). Sorting the table by a
+non-`ID` column or filtering by text still scans, so those stay slow on huge
+dbs; the default `ID` order and window browsing are fast.
 
 ### Switching workloads (important)
 
-The viewer is **not** tied to a program. To analyse another test you only need
-a new `lifetime.db` (rerun step 1); reuse the **same** `*_viewer.html` and pick
-the new db. Re-run step 2 only when you want to change the baked-in defaults or
-you edited `util/perfcct_viewer.html` itself.
+The viewer is **not** tied to a program. To analyse another test you only need a
+new `lifetime.db` (rerun step 1), then restart `perfcct_server.py` with the new
+`--db`. No rebuild, no per-program regeneration.
 
 ---
 

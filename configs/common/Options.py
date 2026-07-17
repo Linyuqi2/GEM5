@@ -227,6 +227,18 @@ def addNoISAOptions(parser, configure_xiangshan=False):
                         action="store_true",
                         default=False,
                         help="dump per-instruction lifetime trace for perfCCT")
+    parser.add_argument("--arch-db-stream-to-disk",
+                        action="store_true",
+                        default=False,
+                        help="write the arch db straight to disk with "
+                        "batched transactions instead of buffering it all "
+                        "in RAM; bounds peak memory for long traces")
+    parser.add_argument("--arch-db-batch-size",
+                        action="store",
+                        type=int,
+                        default=100000,
+                        help="inserts per transaction when "
+                        "--arch-db-stream-to-disk is set")
     parser.add_argument("--enable-rolling",
                         default=False,
                         help="enable rolling perfcnt "

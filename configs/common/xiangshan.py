@@ -718,6 +718,8 @@ CREATE TABLE LoadLifeTimeCommitTrace(
 """
 
         test_sys.arch_db = ArchDBer(arch_db_file=args.arch_db_file)
+        test_sys.arch_db.stream_to_disk = args.arch_db_stream_to_disk
+        test_sys.arch_db.batch_size = args.arch_db_batch_size
         test_sys.arch_db.dump_from_start = args.arch_db_fromstart
         test_sys.arch_db.enable_rolling = args.enable_rolling
         test_sys.arch_db.dump_l1_pf_trace = False

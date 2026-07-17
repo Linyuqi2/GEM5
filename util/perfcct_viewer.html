@@ -1,7 +1,6 @@
 <!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>PerfCCT viewer (dynamic)</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
 <style>
  body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:18px;background:#0f1115;color:#e6e6e6}
  h1{font-size:20px} h2{font-size:16px;margin-top:28px;border-bottom:1px solid #333;padding-bottom:4px}
@@ -20,10 +19,10 @@
  td.jump{cursor:pointer;color:#6cb6ff}
  td.jump:hover{text-decoration:underline}
 </style></head><body>
-<h1>PerfCCT viewer &mdash; dynamic (sql.js)</h1>
+<h1>PerfCCT viewer &mdash; dynamic (server-backed)</h1>
 <div>
- <label class="hint">lifetime.db <input type="file" id="dbfile" accept=".db,.sqlite,.sqlite3"></label>
- <span class="hint" id="status">pick a lifetime.db file to begin (queried in-browser, nothing uploaded)</span>
+ <button id="reconnect" type="button">Reconnect</button>
+ <span class="hint" id="status">connecting to db server ...</span>
 </div>
 <fieldset style="margin-top:10px;border:1px solid #2a2f3a;border-radius:8px;padding:8px 12px">
  <legend class="hint">options (defaults baked in at generation time; edit then <b>Apply</b>)</legend>
@@ -124,10 +123,38 @@ let db=null, P=333, hasMemType=false, hasSquash=false, hasAddr=false, repCols=[]
 let CMIN=0, CMAX=0, NINS=0;
 let excludeIO=true, ioMethod='addr', dramBase=0x80000000, ioLat=200, WIN=2000, dbName='';
 let sortKey='scyc', sortDir=-1, offset=0, trows=[], totalMatch=0, rendered=0;
+// Above BIG_N committed insts, whole-run scans (busiest-cycle, I/O-cycle
+// accounting, cycle compaction, exact match counts) get skipped/approximated so
+// the UI stays responsive; per-window panels stay exact via the AtFetch index.
+const BIG_N=2000000;
+// Max instruction lifetime (cycles) assumed when selecting insts that overlap a
+// panel window. Bounds the AtFetch index range so the query is selective
+// instead of scanning the whole table. Far larger than any real non-I/O life.
+const WINSLACK=20000;
+function isBig(){ return NINS>BIG_N; }
+// Sort keys backed by an index (fast even on huge dbs). Others full-sort the
+// table, so loadPage() refuses them once the db is big.
+const FAST_SORT={id:1,absF:1,cmt:1,scyc:1};
 
 // ===== query helpers =====
-function qall(sql){ const r=db.exec(sql); return r.length?r[0].values:[]; }
+// Queries run on the perfcct_server.py backend (on-disk SQLite), not in the
+// browser, so the db is never loaded into memory here. Synchronous XHR keeps
+// the rest of the viewer (which assumes blocking queries) unchanged.
+function serverQuery(sql){
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/q',false);
+  xhr.setRequestHeader('Content-Type','text/plain');
+  xhr.send(sql);
+  if(xhr.status!==200){
+    let msg=xhr.responseText||('HTTP '+xhr.status);
+    try{ msg=JSON.parse(xhr.responseText).error||msg; }catch(e){}
+    throw new Error(msg);
+  }
+  return JSON.parse(xhr.responseText).values;
+}
+function qall(sql){ return serverQuery(sql); }
 function q1(sql){ const v=qall(sql); return v.length?v[0]:null; }
+function run(sql){ serverQuery(sql); }
 function fmtPc(pc){ return '0x'+Math.floor(Number(pc)).toString(16).padStart(12,'0'); }
 // Which device-I/O detection is active: 'addr' (physical address below the DRAM
 // base => MMIO, the robust method, needs LoadLifeTimeCommitTrace.PAddress) or
@@ -142,11 +169,11 @@ function ioActive(){
 }
 function buildIoIds(){
   if(!db)return;
-  db.run('DROP TABLE IF EXISTS io_ids');
+  run('DROP TABLE IF EXISTS io_ids');
   if(ioActive()==='addr'){
-    db.run('CREATE TEMP TABLE io_ids(ID INTEGER PRIMARY KEY)');
-    db.run(`INSERT OR IGNORE INTO io_ids SELECT ID FROM LoadLifeTimeCommitTrace `+
-           `WHERE PAddress>0 AND PAddress < ${dramBase}`);
+    run('CREATE TEMP TABLE io_ids(ID INTEGER PRIMARY KEY)');
+    run(`INSERT OR IGNORE INTO io_ids SELECT ID FROM LoadLifeTimeCommitTrace `+
+        `WHERE PAddress>0 AND PAddress < ${dramBase}`);
   }
 }
 function ioPred(){
@@ -185,29 +212,59 @@ function initOpts(){
 }
 initOpts();
 
-// ===== db loading =====
-document.getElementById('dbfile').addEventListener('change', async e=>{
-  const f=e.target.files[0]; if(!f)return;
-  setStatus('loading sql.js + reading db ...');
-  const buf=await f.arrayBuffer();
-  const SQL=await initSqlJs({locateFile:fn=>`https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${fn}`});
-  db=new SQL.Database(new Uint8Array(buf));
-  dbName=f.name;
+// ===== db connection (backed by perfcct_server.py) =====
+function serverName(){
+  try{
+    const x=new XMLHttpRequest();
+    x.open('GET','/name',false); x.send();
+    return x.status===200 ? x.responseText : '(remote db)';
+  }catch(e){ return '(remote db)'; }
+}
+function connect(){
+  setStatus('connecting to db server ...');
+  try{
+    serverQuery('SELECT 1');           // ping the backend
+  }catch(err){
+    setStatus('error: cannot reach the db server ('+err.message+'). '+
+      'Open this page via the server, e.g.  '+
+      'python3 util/perfcct_server.py --db path/to/lifetime.db  '+
+      'then browse http://localhost:8000/');
+    return;
+  }
+  db=true;                             // sentinel: backend is connected
+  dbName=serverName();
   initSchema();
-});
+}
+document.getElementById('reconnect').addEventListener('click', connect);
 function setStatus(s){ document.getElementById('status').textContent=s; }
 
 function tableCols(t){ try{return qall(`PRAGMA table_info(${t})`).map(r=>r[1]);}catch(e){return [];} }
 function initSchema(){
   readOpts();
   const main=tableCols('LifeTimeCommitTrace');
-  if(!main.length){ setStatus('error: LifeTimeCommitTrace not found'); return; }
+  if(!main.length){
+    let names=[];
+    try{ names=qall("SELECT name FROM sqlite_master WHERE type='table'")
+             .map(r=>r[0]); }catch(e){}
+    if(!names.length){
+      setStatus('error: no tables readable from this db (the server '+
+        'reported an empty schema). Is --db pointing at the right file?');
+    }else{
+      setStatus('error: LifeTimeCommitTrace not found. Tables present: '+
+        names.join(', ')+'. Run gem5 with --arch-db-dump-lifetime to '+
+        'populate it.');
+    }
+    return;
+  }
   hasMemType=main.includes('MemType');
   hasSquash=tableCols('SquashedLifeTimeTrace').length>0;
   repCols=tableCols('LoadLifeTimeCommitTrace');
   hasAddr=repCols.includes('PAddress');
-  const row=q1('SELECT min(AtFetch),max(AtCommit),count(*) FROM LifeTimeCommitTrace WHERE AtFetch>0');
-  CMIN=Math.floor(row[0]/P); CMAX=Math.floor(row[1]/P); NINS=row[2];
+  // min/max use the AtFetch/AtCommit indexes (instant); NINS is approximated by
+  // max(ID) (AUTOINCREMENT => ~= committed count) to avoid a full count scan.
+  CMIN=Math.floor(q1('SELECT min(AtFetch) FROM LifeTimeCommitTrace WHERE AtFetch>0')[0]/P);
+  CMAX=Math.floor(q1('SELECT max(AtCommit) FROM LifeTimeCommitTrace')[0]/P);
+  NINS=q1('SELECT max(ID) FROM LifeTimeCommitTrace')[0]||0;
   buildIoIds();
   refreshMeta();
   document.getElementById('app').style.display='';
@@ -241,12 +298,15 @@ function ioCycCount(){
 function refreshMeta(){
   const span=CMAX-CMIN; let extra='';
   const m=ioActive();
-  if(m){const ic=ioCycCount();
+  if(m && isBig()){
+    extra='  \u2014 I/O-cycle accounting skipped (large db)';
+  }else if(m){const ic=ioCycCount();
     const how=(m==='addr')?`PA<0x${dramBase.toString(16)}`:`lat\u2265${ioLat}cyc`;
     extra=`  \u2014 device-I/O \u2248${ic.toLocaleString()} cyc (${(100*ic/span).toFixed(0)}%, by ${how}), `+
           `CPU \u2248${(span-ic).toLocaleString()} cyc`;}
+  const napprox=isBig()?'\u2248':'';
   document.getElementById('meta').textContent=
-    `db=${dbName}  period=${P} ticks/cyc  committed insts=${NINS.toLocaleString()}  `+
+    `db=${dbName}  period=${P} ticks/cyc  committed insts=${napprox}${NINS.toLocaleString()}  `+
     `span=${span.toLocaleString()} cyc  [${CMIN.toLocaleString()}..${CMAX.toLocaleString()}]${extra}`;
 }
 
@@ -336,14 +396,17 @@ let win={ds:0,de:-1,det:[],det2:[]};   // WIN (window half-width) is a global op
 function loadWindow(c){
   const ds=Math.max(CMIN, c-WIN), de=Math.min(CMAX, c+WIN);
   const lo=ds*P, hi=de*P;
+  // AtFetch lower bound makes the AtFetch index selective (range [flo,hi])
+  // instead of scanning the whole table; WINSLACK covers in-flight lifetime.
+  const flo=Math.max(0,(ds-WINSLACK)*P);
   // committed insts overlapping [ds,de] (device-I/O loads dropped when excluded)
   const cm=qall(`SELECT ${STAGE_SEL},${memSel()},DisAsm,PC,ID FROM LifeTimeCommitTrace `+
-    `WHERE AtFetch>0 AND AtFetch<=${hi} AND AtCommit>=${lo}${notIO()}`);
+    `WHERE AtFetch>=${flo} AND AtFetch<=${hi} AND AtCommit>=${lo}${notIO()}`);
   win.det=cm.map(detRec);
   win.det2=cm.map(r=>det2Rec(r,false));
   if(hasSquash){
     const sq=qall(`SELECT ${STAGE_SEL},${memSel()},DisAsm,PC,ID FROM SquashedLifeTimeTrace `+
-      `WHERE AtFetch>0 AND AtFetch<=${hi} AND AtCommit>=${lo}${notIO()}`);
+      `WHERE AtFetch>=${flo} AND AtFetch<=${hi} AND AtCommit>=${lo}${notIO()}`);
     for(const r of sq) win.det2.push(det2Rec(r,true));
   }
   win.ds=ds; win.de=de;
@@ -398,6 +461,7 @@ function busyCycle(){
   // bucket (a compute burst; UART-stall buckets commit sparsely & are skipped).
   if(DEFAULTS.startCyc!=null && DEFAULTS.endCyc!=null)
     return Math.floor((DEFAULTS.startCyc+DEFAULTS.endCyc)/2);
+  if(isBig()) return Math.floor((CMIN+CMAX)/2);   // skip full scan on huge dbs
   const W=2000;
   const r=q1(`SELECT AtCommit/${P*W} AS b, count(*) c FROM LifeTimeCommitTrace `+
     `WHERE AtFetch>0${notIO()} GROUP BY b ORDER BY c DESC LIMIT 1`);
@@ -408,7 +472,9 @@ function busyCycle(){
 // (so it jumps, e.g. 1735 -> 2986). When I/O is not excluded, it is 1:1. ----
 let CMAP={on:false};
 function buildCycleMap(){
-  if(!ioActive()){ CMAP={on:false}; return; }
+  // huge dbs: skip the whole-run window-function scan; slider stays 1:1 (I/O
+  // gaps not compacted) but the UI loads immediately.
+  if(!ioActive() || isBig()){ CMAP={on:false}; return; }
   const rows=qall(`SELECT a,b FROM (SELECT (LAG(AtCommit) OVER w)/${P} AS a, `+
     `AtCommit/${P} AS b, CASE WHEN ${ioPred()} THEN 1 ELSE 0 END AS isio `+
     `FROM LifeTimeCommitTrace WHERE AtFetch>0 WINDOW w AS (ORDER BY AtCommit, ID)) `+
@@ -618,11 +684,24 @@ function buildWhere(){
 }
 function loadPage(reset){
   if(!db)return;
+  // On huge dbs only index-backed sorts (ID / absF / cmt / sCyc) are fast; other
+  // columns would full-sort ~all rows and freeze the tab, so refuse and revert.
+  if(isBig() && !FAST_SORT[sortKey]){
+    setStatus(`sort by "${sortKey}" is disabled on large dbs (would scan `+
+      `~${NINS.toLocaleString()} rows); use ID / absF / cmt / sCyc instead.`);
+    sortKey='id'; sortDir=1; syncSortControls();
+  }
   if(reset){offset=0;trows=[];expanded.clear();}
   const ps=Math.max(1,parseInt(document.getElementById('psize').value)||500);
   const where=buildWhere();
-  if(reset) totalMatch=q1(`SELECT count(*) FROM LifeTimeCommitTrace WHERE ${where}`)[0];
-  const ob=`${SORTSQL[sortKey]||'StallCycles'} ${sortDir>0?'ASC':'DESC'}, ID ASC`;
+  // exact match count is a full scan (tens of seconds on huge dbs, even with a
+  // text filter), so approximate by NINS there; only count on smaller dbs.
+  if(reset) totalMatch=isBig()?NINS
+    :q1(`SELECT count(*) FROM LifeTimeCommitTrace WHERE ${where}`)[0];
+  // Secondary ID must match the primary direction, else a DESC sort can't use
+  // the (col,rowid) index and falls back to a full sort (~50s on huge dbs).
+  const dir=sortDir>0?'ASC':'DESC';
+  const ob=`${SORTSQL[sortKey]||'StallCycles'} ${dir}, ID ${dir}`;
   const v=qall(`SELECT ${STAGE_SEL},StallReason,StallCycles,SecondaryReason,StallSpans,`+
     `${memSel()},DisAsm,PC,ID FROM LifeTimeCommitTrace WHERE ${where} ORDER BY ${ob} `+
     `LIMIT ${ps} OFFSET ${offset}`);
@@ -726,5 +805,8 @@ function rebuildTable(){
 function updateCnt(){document.getElementById('cnt').textContent=
   `showing ${trows.length.toLocaleString()} of ${totalMatch.toLocaleString()} matching insts`+
   (trows.length<totalMatch?' \u2014 click "load more"':'');}
+
+// auto-connect to the backend on load
+connect();
 </script>
 </body></html>

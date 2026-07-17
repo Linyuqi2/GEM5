@@ -50,6 +50,14 @@ class ArchDBer(SimObject):
     dump_from_start = Param.Bool(True, "Dump arch db from start")
     enable_rolling = Param.Bool(False, "Dump rolling perfcnt")
 
+    stream_to_disk = Param.Bool(False,
+        "Write the db directly on disk with batched transactions "
+        "instead of buffering everything in an in-memory db. Bounds "
+        "peak memory for long traces (e.g. full SPEC simpoints).")
+    batch_size = Param.UInt64(100000,
+        "In stream_to_disk mode, commit a transaction every this many "
+        "inserts.")
+
     table_cmds = VectorParam.String([], "Tables to create")
     dump_mem_trace = Param.Bool(False, "Dump memory trace")
     dump_l1_pf_trace = Param.Bool(False, "Dump prefetch trace")

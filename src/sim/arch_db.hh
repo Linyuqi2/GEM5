@@ -72,12 +72,21 @@ class ArchDBer : public SimObject
     int rc;
     //path to save
     std::string db_path;
+
+    // Stream directly to an on-disk db (batched transactions) instead of
+    // buffering everything in RAM. Keeps peak memory bounded.
+    bool streamToDisk;
+    uint64_t batchSize;
+    uint64_t pendingInserts;
     // a trace corrsponds to a table
     std::map<std::string, DBTraceManager> _traces;
 
     void create_table(const std::string &sql);
 
     void save_db();
+
+    // Commit the current transaction and open a fresh one (stream mode).
+    void flushBatch();
   public:
     void execmd(std::string cmd);
 
